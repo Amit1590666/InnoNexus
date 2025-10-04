@@ -1,0 +1,7 @@
+streamlit>=1.33
+requests>=2.31
+pandas>=2.0
+sentence-transformers>=3.0
+
+# Optional explicit pins if desired; avoid +cpu suffix with uv
+torch>=2.2,<2.5

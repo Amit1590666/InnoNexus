@@ -1,9 +1,88 @@
 import streamlit as st
 import os
 import glob
-import ollama
+import requests
 import pandas as pd
 from sentence_transformers import SentenceTransformer, util
+from requests.auth import HTTPBasicAuth
+from urllib.parse import urlsplit, urlunsplit
+
+st.set_page_config(page_title="InnoNexus AI Tool", layout="wide")
+# --- Remote Ollama HTTP client (replaces the Python ollama module) ---if st.button("Generate statement 📝", key=K("generate_btn")):
+
+# Normalize base URL so endpoints are appended only once
+def normalize_base_url(url: str) -> str:
+    url = url.strip()
+    if not url:
+        return url
+    u = urlsplit(url if "://" in url else f"https://{url.lstrip('/')}")
+    path = (u.path or "").rstrip("/")
+    for bad in ("/api/chat", "/api/generate", "/api"):
+        if path.endswith(bad):
+            path = path[: -len(bad)]
+            break
+    path = path.rstrip("/")
+    return urlunsplit((u.scheme, u.netloc, path, "", ""))
+
+class RemoteOllama:
+    def __init__(self, base_url, auth=None, force_host=False):
+        self.base_url = normalize_base_url(base_url)
+        self.auth = auth
+        self.force_host = force_host
+
+    def _headers(self):
+        h = {"Content-Type": "application/json"}
+        if self.force_host:
+            h["Host"] = "localhost:11434"
+        return h
+
+    def chat(self, model, messages, stream=False, options=None, timeout=120):
+        url = f"{self.base_url}/api/chat"
+        payload = {"model": model, "messages": messages, "stream": bool(stream)}
+        if options:
+            payload["options"] = options
+        r = requests.post(url, json=payload, headers=self._headers(),
+                          timeout=timeout, auth=self.auth)
+        r.raise_for_status()
+        return r.json()  # {"message":{"content": "..."}}
+
+# --- Sidebar (single source of truth) ---
+st.sidebar.header("InnoNexus")
+st.sidebar.subheader("Ollama AI Configuration")
+desired_model = st.sidebar.text_input("Enter your Ollama Model Name", value="llama3.1:8b", key="cfg_model_name")
+ollama_api_base_raw = st.sidebar.text_input("Ollama API Base URL", value="https://YOUR_TUNNEL.ngrok-free.app", key="cfg_api_base")
+with st.sidebar.expander("Advanced (Auth)"):
+    auth_user = st.text_input("Basic Auth Username", value="", key="cfg_auth_user")
+    auth_pass = st.text_input("Basic Auth Password", value="", type="password", key="cfg_auth_pass")
+    force_host = st.checkbox("Force Host header (use only if needed)", value=False, key="cfg_force_host")
+
+# --- Session-scoped client (no globals) ---
+def get_ollama_client():
+    auth = HTTPBasicAuth(auth_user, auth_pass) if auth_user and auth_pass else None
+    cleaned = normalize_base_url(ollama_api_base_raw)
+    key = (cleaned, auth_user, bool(auth_pass), force_host)
+    if "ollama_client_key" not in st.session_state or st.session_state["ollama_client_key"] != key:
+        st.session_state["ollama_client"] = RemoteOllama(cleaned, auth=auth, force_host=force_host)
+        st.session_state["ollama_client_key"] = key
+    return st.session_state["ollama_client"]
+
+# Default model into session for easy access
+st.session_state.setdefault("desired_model", None)
+if desired_model:
+    st.session_state["desired_model"] = desired_model
+
+def chat_text(prompt: str, model: str = None, options=None, timeout=120) -> str:
+    """Session-safe wrapper around Ollama /api/chat (non-streaming)."""
+    client = get_ollama_client()
+    use_model = model or st.session_state.get("desired_model") or "llama3.1:8b"
+    payload_msgs = [{"role": "user", "content": prompt.strip()}]
+    resp = client.chat(model=use_model, messages=payload_msgs, stream=False,
+                       options=options, timeout=timeout)
+    return resp["message"]["content"].strip()
+
+
+
+
 
 # -----------------------------------------------------------------------------
 # Caching for Performance
@@ -177,12 +256,18 @@ def contradiction_matrix_page(docs_dir, desired_model):
                         if st.button(f"🤖 Get AI Explanation for Principle {num}", key=f"ollama_btn_{num}"):
                             try:
                                 with st.spinner(f"Asking {desired_model} to explain..."):
-                                    prompt = (f"You are an expert in the TRIZ methodology. Explain the TRIZ inventive principle '{name}' (Principle {num}) in detail. The basic description is: '{description}'.\n\nPlease elaborate on:\n1. The core concept.\n2. How it's applied.\n3. Provide at least two practical, real-world examples.")
-                                    response = ollama.chat(model=desired_model, messages=[{'role': 'user', 'content': prompt}])
+                                    prompt = (
+                                        f"You are an expert in the TRIZ methodology. Explain the TRIZ inventive principle '{name}' "
+                                        f"(Principle {num}) in detail. The basic description is: '{description}'.\n\n"
+                                        "Please elaborate on:\n1. The core concept.\n2. How it's applied.\n"
+                                        "3. Provide at least two practical, real-world examples."
+                                    )
+                                    ai_text = chat_text(prompt, model=desired_model)
                                     st.markdown("### AI-Generated Explanation")
-                                    st.info(response['message']['content'])
+                                    st.info(ai_text)
                             except Exception as e:
                                 st.error(f"Could not connect to Ollama. Ensure it's running and the model '{desired_model}' is available. Error: {e}")
+
 
                         # Local File Integration
                         principle_dir = os.path.join(docs_dir, f"principle_{num}")
@@ -220,24 +305,22 @@ def ai_problem_solver_page(desired_model):
             try:
                 with st.spinner(f"Asking {desired_model} to analyze your problem..."):
                     prompt = (
-                        f"You are a world-class TRIZ expert. Analyze the following engineering problem and its contradiction. "
-                        f"Your task is to identify the most relevant TRIZ inventive principles that could solve this problem. "
-                        f"For each principle you identify, you must:\n"
-                        f"1. Name the principle and its number.\n"
-                        f"2. Briefly explain why it is applicable to this specific problem.\n"
-                        f"3. Provide a concrete example of a solution concept based on that principle for the given problem.\n\n"
+                        "You are a world-class TRIZ expert. Analyze the following engineering problem and its contradiction. "
+                        "Your task is to identify the most relevant TRIZ inventive principles that could solve this problem. "
+                        "For each principle you identify, you must:\n"
+                        "1. Name the principle and its number.\n"
+                        "2. Briefly explain why it is applicable to this specific problem.\n"
+                        "3. Provide a concrete example of a solution concept based on that principle for the given problem.\n\n"
                         f"**Problem Statement:**\n{problem_statement}\n\n"
                         f"**Contradiction:**\n{contradiction}\n\n"
-                        f"Provide your analysis clearly and concisely, focusing only on TRIZ-based solutions."
+                        "Provide your analysis clearly and concisely, focusing only on TRIZ-based solutions."
                     )
-                    response = ollama.chat(
-                        model=desired_model,
-                        messages=[{'role': 'user', 'content': prompt}]
-                    )
+                    ai_text = chat_text(prompt, model=desired_model)
                     st.markdown("### AI-Powered TRIZ Analysis")
-                    st.success(response['message']['content'])
+                    st.success(ai_text)
             except Exception as e:
                 st.error(f"Could not connect to Ollama. Please ensure Ollama is running and the model '{desired_model}' is available. Error: {e}")
+
 
 def patent_search_page():
     """Renders the AI-Powered Patent Search page."""
@@ -286,8 +369,7 @@ def patent_search_page():
 
                         import pandas as pd
                         import json
-                        
-                        def analyze_patent_with_llama3(title, abstract, claims, model="llama3.1:8b"):
+                        def analyze_patent_with_llama3(title, abstract, claims, model):
                             prompt = f"""
                         Analyze the following patent:
                         
@@ -306,58 +388,38 @@ def patent_search_page():
                           "Summary": "<single CLEAR summary sentence>"
                         }}
                         Your entire response must be valid JSON.
-                        """
-                            import ollama
-                            response = ollama.chat(model=model, messages=[
-                                {"role": "user", "content": prompt}
-                            ])
-                            # Grab LLM output and convert to JSON dict
-                            raw_content = response["message"]["content"]
-                            # Try to correct common formatting errors:
+                        """.strip()
+                            raw_content = chat_text(prompt, model=model)
                             json_start = raw_content.find("{")
                             json_end = raw_content.rfind("}")
                             try:
                                 json_str = raw_content[json_start:json_end+1]
+                                import json
                                 answers = json.loads(json_str)
-                            except:
-                                # If LLM fails, put empty fields
+                            except Exception:
                                 answers = {
                                     "Topic": "", "Domain": "", "Ecosystem": "",
                                     "Categorization": "", "NewTech": "",
                                     "ProblemAlt": "", "Summary": ""
                                 }
                             return answers
-                        results = []
-                        for _, row in relevant_patents.iterrows():
-                            title = row.get('title', '')
-                            abstract = row.get('abstract', '')
-                            claims = row.get('claims', '')
-                            relevance = row.get('relevance', '')
-                            answers = analyze_patent_with_llama3(title, abstract, claims)
-                            answers['Relevance'] = relevance
-                            results.append(answers)
-                        
-                        final_df = pd.DataFrame(results)
-                        st.dataframe(final_df)
 
-def problem_statment_canvas_page():
-    import ollama
+
+
+    # ---------- Streamlit UI ----------
+    #st.set_page_config(page_title="Problem Canvas Generator", layout="wide")
+
+def problem_statment_canvas_page(desired_model):
     def call_llama(prompt: str) -> str:
-        """Send prompt to local Llama-3-8B via Ollama and return the reply text."""
-        response = ollama.chat(
-            model="llama3.1:8b",
+        client = get_ollama_client()
+        resp = client.chat(
+            model=desired_model,
             messages=[{"role": "user", "content": prompt.strip()}],
-            stream=False,  # easier to capture full answer
+            stream=False
         )
-        return response["message"]["content"].strip()
-    
-    
+        return resp["message"]["content"].strip()
+
     def build_prompt(ctx, prob, cust, emo, quant, alt, alt_sc):
-        """
-        Build a prompt that forces ONE paragraph in the flow:
-        Context ➜ Problem ➜ Impact ➜ Motivation ➜ Proof ➜ Opportunity ➜ Competitive-advantage
-        The arrow order matches the red-dot guide in your 2nd image.
-        """
         return f"""
 You are an expert problem-statement writer.
 
@@ -377,10 +439,11 @@ Quantifiable impact: {quant}
 Current alternative: {alt}
 Alternative shortcomings: {alt_sc}
 """
+    # UI continues unchanged...
+
     
     
-    # ---------- Streamlit UI ----------
-    st.set_page_config(page_title="Problem Canvas Generator", layout="wide")
+
     
     st.markdown(
         "<h2 style='margin-bottom:1rem'>Problem Statement Canvas</h2>",
@@ -476,7 +539,7 @@ def root_conflict_analysis_page():
     import io
 
         # Set page config
-    st.set_page_config(page_title="Manual RCA+ Tool", layout="wide")
+    #st.set_page_config(page_title="Manual RCA+ Tool", layout="wide")
 
     def initialize_session_state():
         """Initialize session state with default data"""
@@ -1166,40 +1229,43 @@ def root_conflict_analysis_page():
 # -----------------------------------------------------------------------------
 
 def main():
-    """Main function to run the Streamlit app."""
-    st.set_page_config(page_title="TRIZ AI Tool", layout="wide")
+    # Sidebar brand
+    # Sidebar brand
+    #st.sidebar.title("InnoNexus")
     
-    st.sidebar.title("InnoNexus")
-    #st.sidebar.text("DTICI")
-    
-    # --- OLLAMA INTEGRATION: Model Selection ---
-    st.sidebar.header("Ollama AI Configuration")
-    desired_model = st.sidebar.text_input("Enter your Ollama Model Name", value="llama3.1:8b")
+    # Ollama config (give every widget a unique key)
 
-    # --- PAGE NAVIGATION ---
+
+    
+
+    # Navigation
     st.sidebar.header("Navigation")
-    page = st.sidebar.radio("Choose a tool", ["Problem Statement Canvas", "Patent Search", "RCA+", "Contradiction Matrix", "AI Problem Solver"])
+    page = st.sidebar.radio(
+        "Choose a tool",
+        ["Problem Statement Canvas", "Patent Search", "RCA+", "Contradiction Matrix", "AI Problem Solver"]
+    )
 
-    # Robust path to the triz_docs directory
+    # Robust path for docs_dir if needed by a page
+    import os
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
     except NameError:
         script_dir = os.getcwd()
     docs_dir = os.path.join(script_dir, "triz_docs")
 
-    if not os.path.isdir(docs_dir):
-        st.sidebar.warning("`triz_docs` directory not found. Create it to see local files.")
-
-    if page == "Contradiction Matrix":
+    # Route to pages (these functions must NOT call st.set_page_config)
+    if page == "Problem Statement Canvas":
+        problem_statment_canvas_page(desired_model)
+    elif page == "Patent Search":
+        patent_search_page()
+    elif page == "RCA+":
+        root_conflict_analysis_page()
+    elif page == "Contradiction Matrix":
         contradiction_matrix_page(docs_dir, desired_model)
     elif page == "AI Problem Solver":
         ai_problem_solver_page(desired_model)
-    elif page == "Patent Search":
-        patent_search_page()
-    elif page == "Problem Statement Canvas":
-        problem_statment_canvas_page() 
-    elif page == "RCA+":
-        root_conflict_analysis_page() 
 
+# Ensure main() actually runs
 if __name__ == "__main__":
     main()
+
